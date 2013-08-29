@@ -434,8 +434,6 @@ private[libs] class AbortOnIterateeDone() extends RuntimeException
 
     def get(): Future[Response] = prepare("GET").execute
 
-    private[libs] val passThrough = { bytes: Array[Byte] => bytes }
-
     def getJsStream(implicit ec: ExecutionContext): Future[Enumerator[JsValue]] = {
       getAndEnumerateRaw(ec).map( _.through( Enumeratee.map[Array[Byte]]( Json.parse )(ec) ) )(ec)
     }
@@ -452,25 +450,25 @@ private[libs] class AbortOnIterateeDone() extends RuntimeException
       }(ec)
     }
 
-    def getAndEnumerateRaw(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = getAndEnumerate[Array[Byte]](passThrough)(ec)
+    def getAndEnumerateRaw(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = getAndEnumerate[Array[Byte]](identity)(ec)
     def getAndEnumerate[T](f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
       prepare("GET").enumerate(f)(ec)
     }
 
-    def postAndEnumerateRaw(body: File)(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = postAndEnumerate[Array[Byte]](body)(passThrough)(ec)
+    def postAndEnumerateRaw(body: File)(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = postAndEnumerate[Array[Byte]](body)(identity)(ec)
     def postAndEnumerate[T](body: File)(f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
       prepare("POST", body).enumerate(f)(ec)
     }
-    def postAndEnumerateRaw[A](body: A)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[Array[Byte]]] = postAndEnumerate[A, Array[Byte]](body)(passThrough)(ec, wrt, ct)
+    def postAndEnumerateRaw[A](body: A)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[Array[Byte]]] = postAndEnumerate[A, Array[Byte]](body)(identity)(ec, wrt, ct)
     def postAndEnumerate[A, T](body: A)(f: Array[Byte] => T)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[T]] = {
       prepare("POST", body).enumerate(f)(ec)
     }
 
-    def putAndEnumerateRaw(body: File)(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = putAndEnumerate[Array[Byte]](body)(passThrough)(ec)
+    def putAndEnumerateRaw(body: File)(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = putAndEnumerate[Array[Byte]](body)(identity)(ec)
     def putAndEnumerate[T](body: File)(f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
       prepare("PUT", body).enumerate(f)(ec)
     }
-    def putAndEnumerateRaw[A](body: A)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[Array[Byte]]] = putAndEnumerate[A, Array[Byte]](body)(passThrough)(ec, wrt, ct)
+    def putAndEnumerateRaw[A](body: A)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[Array[Byte]]] = putAndEnumerate[A, Array[Byte]](body)(identity)(ec, wrt, ct)
     def putAndEnumerate[A, T](body: A)(f: Array[Byte] => T)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[T]] = {
       prepare("PUT", body).enumerate(f)(ec)
     }
