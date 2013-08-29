@@ -2,9 +2,10 @@ package play.api.libs.ws
 
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
-import scala.concurrent.{ Future, Promise }
+import scala.concurrent.{ ExecutionContext, Future, Promise }
 import play.api.libs.iteratee._
 import play.api.libs.iteratee.Input._
+import play.api.libs.json._
 import play.api.http.{ Writeable, ContentTypeOf }
 import com.ning.http.client.{
   AsyncHttpClient,
@@ -16,7 +17,8 @@ import com.ning.http.client.{
   HttpResponseStatus,
   Response => AHCResponse,
   Cookie => AHCCookie,
-  PerRequestConfig
+  PerRequestConfig,
+  AsyncHandler
 }
 import collection.immutable.TreeMap
 import play.core.utils.CaseInsensitiveOrdered
@@ -179,6 +181,63 @@ object WS {
         }
       })
       result.future
+    }
+
+private[libs] class AbortOnIterateeDone() extends RuntimeException
+    private[libs] val WSlogger = play.api.Logger("WS")
+
+    private[libs] def enumerate[T](f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
+      import com.ning.http.client.AsyncHandler.STATE
+
+      val promise = Promise[Enumerator[T]]()
+      val promiseStatus = Promise[Int]()
+      val promiseHeader = Promise[HttpResponseHeaders]()
+      val (enumerator, channel) = Concurrent.broadcast[Array[Byte]]
+      val listenableFuture = WS.client.executeRequest(this.build(), new AsyncHandler[Unit]() {
+        override def onThrowable(p1: Throwable) {
+          p1 match {
+            case _: AbortOnIterateeDone => WSlogger.debug(s"WS call aborted on purpose : $p1")
+            case _ => {
+              WSlogger.debug("Actual exception, closing enumerator channel and leaking exception")
+              channel.eofAndEnd()
+              if (!promiseStatus.isCompleted) promiseStatus.failure(p1)
+              if (!promiseHeader.isCompleted) promiseHeader.failure(p1)
+              throw p1
+            }
+          }
+        }
+        override def onBodyPartReceived(p1: HttpResponseBodyPart): STATE = {
+          channel.push(p1.getBodyPartBytes)
+          STATE.CONTINUE
+        }
+        override def onStatusReceived(p1: HttpResponseStatus): STATE = {
+          if (p1.getStatusCode >= 300) {
+            promiseStatus.failure(new IllegalStateException(s"HTTP status is ${p1.getStatusCode} for URL ${url}"))
+          } else {
+            promiseStatus.success(p1.getStatusCode)
+          }
+          STATE.CONTINUE
+        }
+        override def onHeadersReceived(p1: HttpResponseHeaders): STATE =  {
+          promiseHeader.success(p1)
+          STATE.CONTINUE
+        }
+        override def onCompleted() {
+          WSlogger.debug("Closing channel as WS call is completed")
+          channel.eofAndEnd()
+        }
+      })
+      promise.success(enumerator.through(Enumeratee.onIterateeDone[Array[Byte]]({ () =>
+        WSlogger.debug("Iteratee is done ...")
+        if (!listenableFuture.isDone) {
+          listenableFuture.abort(new AbortOnIterateeDone())
+          channel.eofAndEnd()
+          WSlogger.debug("Aborting WS call")
+        } else {
+          WSlogger.debug("WS Call already finished")
+        }
+      })(ec)).through( Enumeratee.map[Array[Byte]]( bytes => f( bytes ) )(ec) ) ) 
+      promiseStatus.future.flatMap(_ => promiseHeader.future.flatMap(_ => promise.future)(ec))(ec)
     }
 
     /**
@@ -375,6 +434,46 @@ object WS {
 
     def get(): Future[Response] = prepare("GET").execute
 
+    private[libs] val passThrough = { bytes: Array[Byte] => bytes }
+
+    def getJsStream(implicit ec: ExecutionContext): Future[Enumerator[JsValue]] = {
+      getAndEnumerateRaw(ec).map( _.through( Enumeratee.map[Array[Byte]]( Json.parse )(ec) ) )(ec)
+    }
+
+    def getFromJsStream[A](reader: Reads[A])(implicit ec: ExecutionContext): Future[Enumerator[A]] = {
+      getAndEnumerateRaw(ec).map {
+        _.through( Enumeratee.map[Array[Byte]]( Json.parse )(ec) )
+        .through( Enumeratee.map[JsValue]( reader.reads )(ec) )
+        .through( Enumeratee.filter[JsResult[A]] {
+          case _: JsSuccess[A] => true
+          case _ => false
+        }(ec) )
+        .through( Enumeratee.map[JsResult[A]]( _.get )(ec) )
+      }(ec)
+    }
+
+    def getAndEnumerateRaw(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = getAndEnumerate[Array[Byte]](passThrough)(ec)
+    def getAndEnumerate[T](f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
+      prepare("GET").enumerate(f)(ec)
+    }
+
+    def postAndEnumerateRaw(body: File)(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = postAndEnumerate[Array[Byte]](body)(passThrough)(ec)
+    def postAndEnumerate[T](body: File)(f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
+      prepare("POST", body).enumerate(f)(ec)
+    }
+    def postAndEnumerateRaw[A](body: A)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[Array[Byte]]] = postAndEnumerate[A, Array[Byte]](body)(passThrough)(ec, wrt, ct)
+    def postAndEnumerate[A, T](body: A)(f: Array[Byte] => T)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[T]] = {
+      prepare("POST", body).enumerate(f)(ec)
+    }
+
+    def putAndEnumerateRaw(body: File)(implicit ec: ExecutionContext): Future[Enumerator[Array[Byte]]] = putAndEnumerate[Array[Byte]](body)(passThrough)(ec)
+    def putAndEnumerate[T](body: File)(f: Array[Byte] => T)(implicit ec: ExecutionContext): Future[Enumerator[T]] = {
+      prepare("PUT", body).enumerate(f)(ec)
+    }
+    def putAndEnumerateRaw[A](body: A)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[Array[Byte]]] = putAndEnumerate[A, Array[Byte]](body)(passThrough)(ec, wrt, ct)
+    def putAndEnumerate[A, T](body: A)(f: Array[Byte] => T)(implicit ec: ExecutionContext, wrt: Writeable[A], ct: ContentTypeOf[A]): Future[Enumerator[T]] = {
+      prepare("PUT", body).enumerate(f)(ec)
+    }
     /**
      * performs a get with supplied body
      * @param consumer that's handling the response
